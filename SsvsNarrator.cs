@@ -1524,6 +1524,41 @@ static class SsvsNarrator
         return n;
     }
 
+    // ---- UI node tree search & text reading ----
+    static string GetMenuNodeText(IntPtr h, uint menu, string targetNodeName)
+    {
+        if (h == IntPtr.Zero || menu < 0x10000 || string.IsNullOrEmpty(targetNodeName)) return "";
+        uint rootNode = ReadU32(h, menu + 0x20);
+        if (rootNode < 0x10000 || rootNode > 0x7fff0000) return "";
+        uint currNode = ReadU32(h, rootNode + 0x0c);
+        int depth = 0;
+        while (currNode >= 0x10000 && currNode <= 0x7fff0000 && depth < 200)
+        {
+            uint namePtr = ReadU32(h, currNode + 0x38);
+            if (namePtr >= 0x10000 && namePtr <= 0x7fff0000)
+            {
+                string nName = ReadCString(h, namePtr, 64);
+                if (string.Equals(nName, targetNodeName, StringComparison.OrdinalIgnoreCase))
+                {
+                    uint textObj = ReadU32(h, currNode + 0x7c);
+                    if (textObj >= 0x10000 && textObj <= 0x7fff0000)
+                    {
+                        uint strPtr = ReadU32(h, textObj);
+                        if (strPtr >= 0x10000 && strPtr <= 0x7fff0000)
+                        {
+                            string txt = ReadCString(h, strPtr, 128);
+                            if (txt.Length > 0) return txt.Trim();
+                        }
+                    }
+                    return "";
+                }
+            }
+            currNode = ReadU32(h, currNode + 0x90);
+            depth++;
+        }
+        return "";
+    }
+
     // ---- menu name map ----
     static string MenuName(uint vt)
     {
@@ -1557,6 +1592,7 @@ static class SsvsNarrator
             case 0x4b8514: return (currentLang == "en") ? "Confirmation" : (currentLang == "es") ? "Confirmación" : (currentLang == "ja") ? "確認" : "Confirmação";
             case 0x4b8684: return (currentLang == "en") ? "Ranking" : (currentLang == "es") ? "Clasificación" : (currentLang == "ja") ? "ランキング" : "Classificação";
             case 0x4b9bb4: return (currentLang == "en") ? "Practice Menu" : (currentLang == "es") ? "Menú de Práctica" : (currentLang == "ja") ? "プラクティスメニュー" : "Menu de Treino";
+            case 0x4b7a8c: return (currentLang == "en") ? "Loading Data" : (currentLang == "es") ? "Cargando Datos" : (currentLang == "ja") ? "読み込み中" : "Carregando Dados";
             case 0x4b9a3c: return (currentLang == "en") ? "Overlay" : (currentLang == "es") ? "Superposición" : (currentLang == "ja") ? "オーバーレイ" : "Sobreposição";
             default: return (currentLang == "en") ? "Menu" : (currentLang == "es") ? "Menú" : (currentLang == "ja") ? "メニュー" : "Menu";
         }
@@ -2165,7 +2201,7 @@ static class SsvsNarrator
         // 1. GalleryMenu (0x4b73a4): 29 illustrations indexed in 0x5f02cc
         if (vt == 0x4b73a4)
         {
-            uint gIdx = ReadU32(hProc, 0x5f02cc);
+            uint gIdx = ReadU32(hProc, ResolveAddr(0x5f02cc));
             if (gIdx >= 29) gIdx = 0;
             int g_idx = (int)gIdx;
             int g_count = 29;
@@ -2402,6 +2438,10 @@ static class SsvsNarrator
 
             int curVal = 0;
             string valDisp = "";
+
+            // Try reading the exact displayed text directly from the UI text node ('value1', 'value2', ...)
+            string liveNodeText = GetMenuNodeText(hProc, menu, "value" + (s_idx + 1));
+
             if (itemsArr >= 0x10000)
             {
                 long itemPtr = (long)itemsArr + (long)s_idx * 20;
@@ -2429,7 +2469,27 @@ static class SsvsNarrator
                     curVal = (int)ReadU32(hProc, menu + 0x8c);
                 }
 
-                if (numChoices == 11 || s_key.Contains("volume") || s_key.Contains("sfx") || s_key.Contains("music") || s_key.Contains("scanlines"))
+                // If UI node text is present and valid, use it as primary ground truth!
+                if (!string.IsNullOrEmpty(liveNodeText))
+                {
+                    valDisp = liveNodeText;
+                }
+                // Specific fix: option_bg_music is track selection (numChoices=21), NEVER volume percentage!
+                else if (s_key == "option_bg_music")
+                {
+                    if (choiceKeys >= 0x10000 && numChoices > 0 && curVal >= 0 && curVal < numChoices)
+                    {
+                        uint ck = ReadU32(hProc, (long)choiceKeys + (long)curVal * 4);
+                        if (ck >= 0x10000)
+                        {
+                            string cks = ReadCString(hProc, ck, 64);
+                            if (stringMap.ContainsKey(cks)) valDisp = stringMap[cks];
+                            else valDisp = cks;
+                        }
+                    }
+                    if (valDisp.Length == 0) valDisp = "Track " + (curVal + 1);
+                }
+                else if (numChoices == 11 || s_key.Contains("volume") || s_key.Contains("sfx") || s_key == "option_menu_music" || s_key.Contains("scanlines"))
                 {
                     valDisp = (curVal * 10) + "%";
                 }
@@ -2524,9 +2584,22 @@ static class SsvsNarrator
 
             string action = GetControlActionName(row);
             int totalRows = ControlActionKeys.Length;
-            string c_msg = name + ", " + side + ", " + action + ", " + (row + 1) + ofWord + totalRows;
 
-            string c_dedup = vt.ToString("x8") + "|" + side + "|" + row;
+            // Read the mapped button/key label from UI nodes: 'left_valueX' for P1, 'right_valueX' for P2
+            string valNode = (side == p2Word) ? ("right_value" + (row + 1)) : ("left_value" + (row + 1));
+            string buttonBound = GetMenuNodeText(hProc, menu, valNode);
+            if (!string.IsNullOrEmpty(buttonBound) && stringMap.ContainsKey(buttonBound))
+            {
+                buttonBound = stringMap[buttonBound];
+            }
+
+            string c_msg;
+            if (!string.IsNullOrEmpty(buttonBound))
+                c_msg = name + ", " + side + ", " + action + ": " + buttonBound + ", " + (row + 1) + ofWord + totalRows;
+            else
+                c_msg = name + ", " + side + ", " + action + ", " + (row + 1) + ofWord + totalRows;
+
+            string c_dedup = vt.ToString("x8") + "|" + side + "|" + row + "|" + buttonBound;
             if (!force && c_dedup == lastDedup) return false;
             lastDedup = c_dedup;
             if (verbose) Console.WriteLine("[dbg] controls side=" + side + " row=" + row);
@@ -2598,10 +2671,11 @@ static class SsvsNarrator
             return true;
         }
 
-        // 8. Standard menus (MainMenu, MultiplayerMenu, InGameOptionsMenu, PauseMenu, etc.)
+        // 8. Standard menus (MainMenu, MultiplayerMenu, InGameOptionsMenu, PauseMenu, PracticeMenu, etc.)
         uint arr = ReadU32(hProc, menu + OFF_MENU_LABELARR);
         uint count = ReadU32(hProc, menu + 0x74);
         if (count < 1 || count > 64) count = ReadU32(hProc, menu + OFF_MENU_COUNT);
+        if (count < 1 || count > 64) count = ReadU32(hProc, menu + 0x70);
 
         int idx = ReadSelectedIndex(hProc, menu);
 
@@ -2672,8 +2746,18 @@ static class SsvsNarrator
         }
         else
         {
-            if (key.Length > 0 && stringMap.ContainsKey(key)) disp = stringMap[key];
-            else disp = key;
+            if (key == "select")
+            {
+                disp = (currentLang == "en") ? "Practice Menu" : (currentLang == "es") ? "Menú de Práctica" : (currentLang == "ja") ? "プラクティスメニュー" : "Menu de Treino";
+            }
+            else if (key.Length > 0 && stringMap.ContainsKey(key))
+            {
+                disp = stringMap[key];
+            }
+            else
+            {
+                disp = key;
+            }
         }
 
         bool haveCount = (count >= 1 && count <= 256 && idx >= 0 && idx < (int)count);
